@@ -1,8 +1,10 @@
 import os
+import time
+from typing import cast
 
 import duckdb
 import frappe
-import frappe.utils
+import pandas as pd
 
 DUCKDB_TABLE = "web_page_views"
 
@@ -21,61 +23,57 @@ class DuckDBConnection:
 			self.db.close()
 
 
-def _create_duckdb_table(db, table_name=DUCKDB_TABLE):
-	db.execute(f"""
-		CREATE TABLE IF NOT EXISTS {table_name} (
-			creation TIMESTAMP,
-			is_unique INTEGER,
-			path TEXT,
-			referrer TEXT
-		)
-	""")
+def _get_date_filter(from_date: str | None = None, to_date: str | None = None):
+	if not from_date or not to_date:
+		return ""
 
+	# Add time component if not present
+	if len(from_date) == 10:  # YYYY-MM-DD format
+		from_date += " 00:00:00"
+	if len(to_date) == 10:  # YYYY-MM-DD format
+		to_date += " 23:59:59"
 
-def _get_date_range_filter(date_range: str = "last_30_days"):
-	date_config = _get_date_config(date_range)
-	if not date_config:
-		return "", None, None
-	to_date = frappe.utils.now_datetime()
-	from_date = _calculate_from_date(to_date, date_config)
-	where = f"creation >= '{from_date}' AND creation <= '{to_date}'"
-	return where, from_date, to_date
+	return f"creation >= '{from_date}' AND creation <= '{to_date}'"
 
 
 def _get_empty_analytics():
 	return {"total_unique_views": 0, "total_views": 0, "data": [], "top_referrers": []}
 
 
-def _get_date_config(date_range):
-	return {
-		"today": {"delta": -24, "unit": "hours", "default_interval": "hourly"},
-		"this_week": {"delta": -7, "unit": "days", "default_interval": "daily"},
-		"last_7_days": {"delta": -7, "unit": "days", "default_interval": "daily"},
-		"last_30_days": {"delta": -30, "unit": "days", "default_interval": "daily"},
-		"last_90_days": {"delta": -90, "unit": "days", "default_interval": "weekly"},
-		"last_180_days": {"delta": -180, "unit": "days", "default_interval": "weekly"},
-		"this_year": {"delta": None, "unit": None, "default_interval": "monthly"},
-	}.get(date_range)
+def _get_route_filter(route: str | None = None, route_filter_type: str = "wildcard") -> str:
+	"""Get route filter clause for SQL queries"""
+	if not route:
+		return ""
+
+	if route_filter_type == "exact":
+		return f"path = '{route}'"
+	else:  # wildcard
+		return f"path LIKE '%{route}%'"
 
 
-def _calculate_from_date(to_date, config):
-	if config["delta"] is None:  # Handle "this_year" case
-		return frappe.utils.get_datetime(f"{to_date.year}-01-01")
-	return frappe.utils.add_to_date(to_date, **{config["unit"]: config["delta"]})
-
-
-def reset_duckdb_table(table_name=DUCKDB_TABLE):
+def setup_duckdb_table(table_name=DUCKDB_TABLE):
 	with DuckDBConnection() as db:
-		db.execute(f"DROP TABLE IF EXISTS {table_name}")
-		_create_duckdb_table(db, table_name)
-
-	# Re-ingest all data
-	ingest_web_page_views_to_duckdb(table_name)
+		sql_connection = frappe.db.get_connection()
+		df = pd.read_sql(
+			"SELECT creation, is_unique, path, referrer, time_zone, user_agent FROM `tabWeb Page View`",
+			sql_connection,  # type: ignore
+		)
+		db.register("df", df)
+		db.execute(
+			f"CREATE OR REPLACE TABLE {table_name} AS SELECT creation, CAST(CASE WHEN is_unique = '' OR is_unique IS NULL THEN '0' ELSE CAST(is_unique AS VARCHAR) END AS INTEGER) as is_unique, path, referrer, time_zone, user_agent FROM df"
+		)
+		print(f"Successfully ingested {len(df)} records into DuckDB")
 
 
 def ingest_web_page_views_to_duckdb(table_name=DUCKDB_TABLE):
 	with DuckDBConnection() as db:
-		_create_duckdb_table(db, table_name)
+		table_exists = db.execute(
+			f"SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '{table_name}'"
+		).fetchone()
+		if table_exists and table_exists[0] == 0:
+			setup_duckdb_table(table_name)
+			return
+
 		result = db.execute(f"SELECT MAX(creation) FROM {table_name}").fetchone()
 		last_record = result[0] if result and result[0] else None
 
@@ -84,7 +82,7 @@ def ingest_web_page_views_to_duckdb(table_name=DUCKDB_TABLE):
 		total_count = frappe.db.count("Web Page View", filters=filters)
 		print(f"Starting ingestion of {total_count} records...")
 
-		page_size = 10000
+		page_size = 20000
 		start = 0
 		processed = 0
 
@@ -98,7 +96,7 @@ def ingest_web_page_views_to_duckdb(table_name=DUCKDB_TABLE):
 			records = frappe.get_all(
 				"Web Page View",
 				filters=filters,
-				fields=["creation", "is_unique", "path", "referrer"],
+				fields=["creation", "is_unique", "path", "referrer", "time_zone", "user_agent"],
 				as_list=True,
 				limit=page_size,
 				order_by="creation asc",
@@ -108,7 +106,7 @@ def ingest_web_page_views_to_duckdb(table_name=DUCKDB_TABLE):
 				break
 
 			db.executemany(
-				f"INSERT INTO {table_name} (creation, is_unique, path, referrer) VALUES (?, ?, ?, ?)",
+				f"INSERT INTO {table_name} (creation, is_unique, path, referrer, time_zone, user_agent) VALUES (?, CAST(? AS INTEGER), ?, ?, ?, ?)",
 				records,
 			)
 
@@ -172,7 +170,7 @@ def _get_referrer_domain_query(where_clause, limit=10, table_name=DUCKDB_TABLE):
 				CASE
 					WHEN referrer IS NULL OR referrer = '' THEN 'direct'
 					WHEN REGEXP_MATCHES(referrer, '^https?://([^/]+)') THEN
-						REGEXP_EXTRACT(referrer, '^https?://([^/]+)', 1)
+						REGEXP_REPLACE(REGEXP_EXTRACT(referrer, '^https?://([^/]+)', 1), '^www\\.', '')
 					ELSE 'direct'
 				END as domain,
 				is_unique
@@ -190,30 +188,47 @@ def _get_referrer_domain_query(where_clause, limit=10, table_name=DUCKDB_TABLE):
 	"""
 
 
-def get_page_analytics(route=None, date_range: str = "last_30_days", interval=None, table_name=DUCKDB_TABLE):
+def get_page_analytics(
+	route=None,
+	interval: str = "daily",
+	table_name=DUCKDB_TABLE,
+	from_date: str | None = None,
+	to_date: str | None = None,
+	route_filter_type: str = "wildcard",
+):
 	"""Get analytics data for a specific page route or all pages"""
 	try:
-		date_config = _get_date_config(date_range)
-		if not date_config:
+		# Get date filter
+		date_filter = _get_date_filter(from_date, to_date)
+		if not date_filter:
 			return _get_empty_analytics()
 
-		where, from_date, to_date = _get_date_range_filter(date_range)
-		if route:
-			where += f" AND path = '{route}'"
+		# Add route filter
+		route_filter = _get_route_filter(route, route_filter_type)
 
-		interval = interval or date_config["default_interval"]
+		# Build WHERE clause properly
+		where_conditions = []
+		if date_filter:
+			where_conditions.append(date_filter)
+		if route_filter:
+			where_conditions.append(route_filter)
+
+		where_clause = " AND ".join(where_conditions) if where_conditions else "1=1"
+
+		# Use provided interval or default to daily
+		interval = interval or "daily"
 
 		with DuckDBConnection() as db:
 			# Get interval-based data
-			interval_query = _get_interval_views_query(where, interval, table_name)
+			interval_query = _get_interval_views_query(where_clause, interval, table_name)
 			rows = db.execute(interval_query).fetchall()
 
 			# Get total views
-			total_query = _get_aggregated_views_query(where, table_name)
+			total_query = _get_aggregated_views_query(where_clause, table_name)
 			total_views, total_unique_views = db.execute(total_query).fetchone() or (0, 0)
 
 			# Get top referrers for this specific page/route
-			referrer_query = _get_referrer_domain_query(where, 10, table_name)
+			referrer_query = _get_referrer_domain_query(where_clause, 10, table_name)
 			referrer_rows = db.execute(referrer_query).fetchall()
 
 		return {
@@ -227,13 +242,31 @@ def get_page_analytics(route=None, date_range: str = "last_30_days", interval=No
 		return _get_empty_analytics()
 
 
-def get_top_pages(date_range: str = "last_30_days", table_name=DUCKDB_TABLE):
-	where, _, _ = _get_date_range_filter(date_range)
+def get_top_pages(
+	table_name=DUCKDB_TABLE,
+	route=None,
+	from_date: str | None = None,
+	to_date: str | None = None,
+	route_filter_type: str = "wildcard",
+):
+	# Get date filter
+	date_filter = _get_date_filter(from_date, to_date)
+	route_filter = _get_route_filter(route, route_filter_type)
+
+	# Build WHERE clause properly
+	where_conditions = []
+	if date_filter:
+		where_conditions.append(date_filter)
+	if route_filter:
+		where_conditions.append(route_filter)
+
+	where_clause = "WHERE " + " AND ".join(where_conditions) if where_conditions else ""
+
 	with DuckDBConnection() as db:
 		q = f"""
 			SELECT path as route, COUNT(*) as view_count, SUM(is_unique) as unique_view_count
 			FROM {table_name}
-			WHERE {where}
+			{where_clause}
 			GROUP BY path
 			ORDER BY view_count DESC
 			LIMIT 20
@@ -242,12 +275,30 @@ def get_top_pages(date_range: str = "last_30_days", table_name=DUCKDB_TABLE):
 		return [{"route": r[0], "view_count": r[1], "unique_view_count": r[2]} for r in rows]
 
 
-def get_top_referrers(date_range: str = "last_30_days", table_name=DUCKDB_TABLE):
+def get_top_referrers(
+	table_name=DUCKDB_TABLE,
+	route=None,
+	from_date: str | None = None,
+	to_date: str | None = None,
+	route_filter_type: str = "wildcard",
+):
 	"""Get top referrers from analytics data using SQL for domain extraction"""
 	try:
-		where, _, _ = _get_date_range_filter(date_range)
+		# Get date filter
+		date_filter = _get_date_filter(from_date, to_date)
+		route_filter = _get_route_filter(route, route_filter_type)
+
+		# Build WHERE clause properly
+		where_conditions = []
+		if date_filter:
+			where_conditions.append(date_filter)
+		if route_filter:
+			where_conditions.append(route_filter)
+
+		where_clause = " AND ".join(where_conditions) if where_conditions else "1=1"
+
 		with DuckDBConnection() as db:
-			referrer_query = _get_referrer_domain_query(where, 20, table_name)
+			referrer_query = _get_referrer_domain_query(where_clause, 20, table_name)
 			rows = db.execute(referrer_query).fetchall()
 			return [{"domain": r[0], "count": r[1], "unique_count": r[2]} for r in rows]
 	except Exception as e:
@@ -255,11 +306,37 @@ def get_top_referrers(date_range: str = "last_30_days", table_name=DUCKDB_TABLE)
 		return []
 
 
-def get_overall_analytics(date_range: str = "last_30_days", interval=None, table_name=DUCKDB_TABLE):
+def get_overall_analytics(
+	interval: str = "daily",
+	table_name=DUCKDB_TABLE,
+	route=None,
+	from_date: str | None = None,
+	to_date: str | None = None,
+	route_filter_type: str = "wildcard",
+):
 	"""Get overall site analytics with top pages and referrers"""
-	analytics = get_page_analytics(None, date_range, interval, table_name)
-	analytics["top_pages"] = get_top_pages(date_range=date_range, table_name=table_name)
-	analytics["top_referrers"] = get_top_referrers(date_range=date_range, table_name=table_name)
+	analytics = get_page_analytics(
+		route=route,
+		interval=interval,
+		table_name=table_name,
+		from_date=from_date,
+		to_date=to_date,
+		route_filter_type=route_filter_type,
+	)
+	analytics["top_pages"] = get_top_pages(
+		table_name=table_name,
+		route=route,
+		from_date=from_date,
+		to_date=to_date,
+		route_filter_type=route_filter_type,
+	)
+	analytics["top_referrers"] = get_top_referrers(
+		table_name=table_name,
+		route=route,
+		from_date=from_date,
+		to_date=to_date,
+		route_filter_type=route_filter_type,
+	)
 	return analytics
 
 

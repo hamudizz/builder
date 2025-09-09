@@ -14,6 +14,7 @@ from frappe.model.document import Document
 from frappe.utils.caching import redis_cache
 from frappe.utils.telemetry import POSTHOG_HOST_FIELD, POSTHOG_PROJECT_FIELD
 from PIL import Image
+from werkzeug.wrappers import Response
 
 from builder import builder_analytics
 from builder.builder.doctype.builder_page.builder_page import BuilderPageRenderer
@@ -67,7 +68,7 @@ def get_posthog_settings():
 
 
 @frappe.whitelist()
-def get_page_preview_html(page: str, **kwarg) -> str:
+def get_page_preview_html(page: str, **kwarg) -> Response:
 	# to load preview without publishing
 	frappe.form_dict.update(kwarg)
 	frappe.local.request.for_preview = True
@@ -77,10 +78,10 @@ def get_page_preview_html(page: str, **kwarg) -> str:
 	frappe.local.no_cache = 1
 	renderer.init_context()
 	response = renderer.render()
-	page = frappe.get_cached_doc("Builder Page", page)
+	page_doc = frappe.get_cached_doc("Builder Page", page)
 	frappe.enqueue_doc(
-		page.doctype,
-		page.name,
+		page_doc.doctype,
+		page_doc.name,
 		"generate_page_preview_image",
 		html=str(response.data, "utf-8"),
 		queue="short",
@@ -273,10 +274,26 @@ def sync_component(component_id: str):
 
 
 @frappe.whitelist()
-def get_page_analytics(route=None, date_range: str = "last_30_days", interval=None):
-	return builder_analytics.get_page_analytics(route, date_range, interval)
+def get_page_analytics(
+	route=None, interval: str = "daily", from_date=None, to_date=None, route_filter_type: str = "wildcard"
+):
+	return builder_analytics.get_page_analytics(
+		route=route,
+		interval=interval,
+		from_date=from_date,
+		to_date=to_date,
+		route_filter_type=route_filter_type,
+	)
 
 
 @frappe.whitelist()
-def get_overall_analytics(date_range: str = "last_30_days", interval=None):
-	return builder_analytics.get_overall_analytics(date_range, interval)
+def get_overall_analytics(
+	interval: str = "daily", route=None, from_date=None, to_date=None, route_filter_type: str = "wildcard"
+):
+	return builder_analytics.get_overall_analytics(
+		interval=interval,
+		route=route,
+		from_date=from_date,
+		to_date=to_date,
+		route_filter_type=route_filter_type,
+	)

@@ -37,7 +37,6 @@ declare module 'vue' {
     BuilderRightPanel: typeof import('./src/components/BuilderRightPanel.vue')['default']
     BuilderSettings: typeof import('./src/components/BuilderSettings.vue')['default']
     BuilderToolbar: typeof import('./src/components/BuilderToolbar.vue')['default']
-    BuilderVariables: typeof import('./src/components/BuilderVariables.vue')['default']
     Chart: typeof import('./src/components/Icons/Chart.vue')['default']
     Code: typeof import('./src/components/Icons/Code.vue')['default']
     CodeEditor: typeof import('./src/components/Controls/CodeEditor.vue')['default']
@@ -117,5 +116,6 @@ declare module 'vue' {
     TemplatePagePreview: typeof import('./src/components/TemplatePagePreview.vue')['default']
     TemplateSelector: typeof import('./src/components/TemplateSelector.vue')['default']
     TextBlock: typeof import('./src/components/TextBlock.vue')['default']
+    VariableManager: typeof import('./src/components/Modals/VariableManager.vue')['default']
   }
 }
